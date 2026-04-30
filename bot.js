@@ -194,118 +194,162 @@ async function handleRecord(message, args) {
     }
   }
 
+  // Gather all non-bot members currently in the voice channel
+  const nonBotMembers = [...voiceChannel.members.values()].filter(m => !m.user.bot);
+  if (nonBotMembers.length === 0) {
+    return message.reply('❌ No non-bot users are in the voice channel!');
+  }
+
+  const memberIds = nonBotMembers.map(m => m.id);
+  log('info', `[RECORD] Starting ${duration}s recording in guild "${message.guild.name}" ` +
+    `(channel: "${voiceChannel.name}"). Subscribing to ${nonBotMembers.length} user(s): [${memberIds.join(', ')}]`);
+
   recordingInProgress.add(message.guildId);
 
-  try {
-    const userId = message.author.id;
-    const receiver = connection.receiver;
+  // Per-user PCM buffer: userId -> Buffer[]
+  const userPcmChunks = new Map();
+  const activeStreams = [];
+  const receiver = connection.receiver;
 
-    await message.reply(`🎤 Recording for ${duration} seconds… speak now!`);
-    log('info', `Recording started in guild "${message.guild.name}" for ${duration} seconds.`);
+  for (const member of nonBotMembers) {
+    const userId = member.id;
+    userPcmChunks.set(userId, []);
 
-    // Subscribe to the requesting user's audio (Opus-encoded stream)
-    const audioStream = receiver.subscribe(userId, {
-      end: {
-        behavior: EndBehaviorType.AfterSilence,
-        duration: 500, // end stream after 500 ms of silence
-      },
-    });
+    try {
+      const audioStream = receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
+      });
 
-    // Decode Opus → raw PCM (48 kHz, 2-channel, 16-bit signed)
-    const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-    const pcmChunks = [];
+      // Decode Opus → raw PCM (48 kHz, 2-channel, 16-bit signed)
+      const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+      const decodeStream = audioStream.pipe(decoder);
 
-    const decodeStream = audioStream.pipe(decoder);
-    decodeStream.on('data', (chunk) => pcmChunks.push(chunk));
-
-    // Wait for stream to end naturally (silence) or hit the duration timeout
-    await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        audioStream.destroy();
-        resolve();
-      }, duration * 1000);
+      decodeStream.on('data', (chunk) => {
+        userPcmChunks.get(userId).push(chunk);
+      });
 
       decodeStream.on('end', () => {
-        clearTimeout(timeout);
-        resolve();
+        const totalBytes = userPcmChunks.get(userId).reduce((s, c) => s + c.length, 0);
+        log('info', `[RECORD] Stream ended for user ${userId} (${member.user.tag}) — buffered: ${totalBytes} bytes`);
       });
 
       decodeStream.on('error', (err) => {
-        log('error', 'Decoder stream error:', err);
-        clearTimeout(timeout);
-        resolve();
+        log('error', `[RECORD] Decoder error for user ${userId} (${member.user.tag}): ${err.message}`);
       });
 
       audioStream.on('error', (err) => {
-        log('error', 'Audio stream error:', err);
-        clearTimeout(timeout);
-        resolve();
+        log('error', `[RECORD] Audio stream error for user ${userId} (${member.user.tag}): ${err.message}`);
       });
-    });
 
-    await message.channel.send('🔄 Processing your audio…');
+      activeStreams.push({ audioStream, decodeStream, userId });
+      log('info', `[RECORD] Subscribed to user ${userId} (${member.user.tag})`);
+    } catch (err) {
+      log('error', `[RECORD] Failed to subscribe to user ${userId} (${member.user.tag}): ${err.message}`);
+    }
+  }
 
-    const pcmData = Buffer.concat(pcmChunks);
+  try {
+    await message.reply(
+      `🎤 Recording for ${duration} seconds… speak now! (listening to ${nonBotMembers.length} user(s))`
+    );
 
-    if (pcmData.length === 0) {
-      await message.channel.send('🔇 No audio detected. Make sure you spoke during the recording!');
+    // Wait for the full recording window — collect audio from all users simultaneously
+    await new Promise((resolve) => setTimeout(resolve, duration * 1000));
+
+    // Destroy all active streams after the window closes
+    for (const { audioStream, decodeStream, userId } of activeStreams) {
+      try { decodeStream.destroy(); } catch (err) {
+        log('warn', `[RECORD] Error destroying decode stream for user ${userId}: ${err.message}`);
+      }
+      try { audioStream.destroy(); } catch (err) {
+        log('warn', `[RECORD] Error destroying audio stream for user ${userId}: ${err.message}`);
+      }
+    }
+
+    await message.channel.send('🔄 Processing audio…');
+
+    // Log buffer stats for every subscribed user
+    let anyAudio = false;
+    for (const [userId, chunks] of userPcmChunks) {
+      const totalBytes = chunks.reduce((s, c) => s + c.length, 0);
+      log('info', `[RECORD] Buffer stats — user ${userId}: ${chunks.length} chunk(s), ${totalBytes} bytes`);
+      if (totalBytes > 0) anyAudio = true;
+    }
+
+    if (!anyAudio) {
+      log('info', `[RECORD] No audio data received from any user in guild "${message.guild.name}".`);
+      await message.channel.send(
+        '🔇 No audio detected from anyone. Make sure your mic isn\'t muted and you\'re speaking!'
+      );
       return;
     }
 
-    // Convert raw PCM to WAV
-    const wavFile = path.join(os.tmpdir(), `audio_${Date.now()}_${userId}.wav`);
-    const wavHeader = createWavHeader(pcmData.length);
-    fs.writeFileSync(wavFile, Buffer.concat([wavHeader, pcmData]));
-
-    try {
-      // Transcribe with Whisper
-      const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(wavFile),
-        model: 'whisper-1',
-      });
-
-      const text = transcription.text.trim();
-
-      if (!text) {
-        await message.channel.send('🔇 No speech detected. Please try again.');
-        return;
+    // Process each user who produced audio
+    for (const [userId, chunks] of userPcmChunks) {
+      const pcmData = Buffer.concat(chunks);
+      if (pcmData.length === 0) {
+        log('info', `[RECORD] Skipping user ${userId} — no audio buffered.`);
+        continue;
       }
 
-      log('info', `Transcribed (user ${userId}): ${text}`);
+      const wavFile = path.join(os.tmpdir(), `audio_${Date.now()}_${userId}.wav`);
+      try {
+        const wavHeader = createWavHeader(pcmData.length);
+        fs.writeFileSync(wavFile, Buffer.concat([wavHeader, pcmData]));
+        log('info', `[RECORD] WAV written for user ${userId}: ${wavFile} (${pcmData.length} PCM bytes)`);
 
-      // Build conversation history
-      let history = conversationHistory.get(userId) || [];
-      history.push({ role: 'user', content: text });
+        // Transcribe with Whisper
+        const transcription = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(wavFile),
+          model: 'whisper-1',
+        });
 
-      if (history.length > MAX_HISTORY * 2) {
-        history = history.slice(-(MAX_HISTORY * 2));
-      }
+        const text = transcription.text.trim();
 
-      const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
+        if (!text) {
+          log('info', `[RECORD] Whisper returned empty transcription for user ${userId}.`);
+          await message.channel.send(`<@${userId}>: 🔇 No speech detected in your audio.`);
+          continue;
+        }
 
-      // Get ChatGPT response
-      log('info', `Requesting ChatGPT response for user ${userId}…`);
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-3.5-turbo',
-        messages,
-      });
+        log('info', `[RECORD] Transcription for user ${userId}: ${text}`);
 
-      const reply = completion.choices[0].message.content.trim();
-      history.push({ role: 'assistant', content: reply });
-      conversationHistory.set(userId, history);
+        // Build conversation history
+        let history = conversationHistory.get(userId) || [];
+        history.push({ role: 'user', content: text });
+        if (history.length > MAX_HISTORY * 2) {
+          history = history.slice(-(MAX_HISTORY * 2));
+        }
 
-      await message.channel.send(`**<@${userId}> said:** ${text}\n**Bot:** ${reply}`);
-      await message.channel.send('✅ Ready! Use `!record` again to ask another question.');
+        const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history];
 
-    } finally {
-      // Always clean up the temp file; ignore ENOENT but log unexpected errors
-      try { fs.unlinkSync(wavFile); } catch (err) {
-        if (err.code !== 'ENOENT') log('error', 'Failed to clean up temp file:', err);
+        // Get ChatGPT response
+        log('info', `[RECORD] Requesting ChatGPT response for user ${userId}…`);
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-3.5-turbo',
+          messages,
+        });
+
+        const reply = completion.choices[0].message.content.trim();
+        history.push({ role: 'assistant', content: reply });
+        conversationHistory.set(userId, history);
+
+        await message.channel.send(`**<@${userId}> said:** ${text}\n**Bot:** ${reply}`);
+
+      } catch (err) {
+        log('error', `[RECORD] Error processing audio for user ${userId}: ${err.message}`);
+        await message.channel.send(`<@${userId}>: ⚠️ Failed to process your audio. (${err.message})`);
+      } finally {
+        try { fs.unlinkSync(wavFile); } catch (e) {
+          if (e.code !== 'ENOENT') log('error', `[RECORD] Failed to clean up temp file for user ${userId}: ${e.message}`);
+        }
       }
     }
 
+    await message.channel.send('✅ Done! Use `!record` again to ask another question.');
+
   } catch (error) {
-    log('error', `Error during recording in guild "${message.guild.name}":`, error);
+    log('error', `[RECORD] Unexpected error in guild "${message.guild.name}":`, error);
     await message.channel.send('⚠️ An error occurred during recording. Please try again.');
   } finally {
     recordingInProgress.delete(message.guildId);
