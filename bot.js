@@ -247,7 +247,7 @@ async function handleRecord(message, args) {
 
     try {
       const audioStream = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence, duration: 500 },
+        end: { behavior: EndBehaviorType.Manual },
       });
 
       // Decode Opus → raw PCM (48 kHz, 2-channel, 16-bit signed)
