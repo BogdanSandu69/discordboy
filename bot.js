@@ -174,7 +174,7 @@ async function handleJoin(message) {
     log('info', `Connected to voice channel "${voiceChannel.name}" in guild "${message.guild.name}".`);
     // Speak a greeting in the voice channel
     try {
-      await speakInChannel(connection, "Well, hello there. DiscordBoy at your service. Use the record command whenever you're ready to speak with me.");
+      await speakInChannel(connection, "Hi, I'm here to listen.");
     } catch (err) {
       log('error', 'Failed to speak greeting:', err.message);
     }
