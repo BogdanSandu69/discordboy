@@ -1,9 +1,9 @@
 services:
   - type: web
     name: discordboy
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    runtime: node
+    buildCommand: npm install
+    startCommand: node bot.js
     envVars:
       - key: DISCORD_TOKEN
         sync: false

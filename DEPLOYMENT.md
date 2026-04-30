@@ -74,10 +74,10 @@ Before deploying, you need:
 3. **Configure Service**
    ```
    Name: discordboy
-   Runtime: Python 3
+   Runtime: Node
    Branch: main
-   Build Command: pip install -r requirements.txt
-   Start Command: python bot.py
+   Build Command: npm install
+   Start Command: node bot.js
    ```
 
 4. **Set Environment Variables**
@@ -94,7 +94,7 @@ Before deploying, you need:
 
 6. **Deploy!**
    - Click **Create Web Service**
-   - Check logs for "Bot connected!" message
+   - Check logs for "Logged in as YourBot#1234" message
 
 ---
 
@@ -122,7 +122,7 @@ If using the **free plan**, keep your bot awake using UptimeRobot:
 - See bot connection status, transcriptions, AI responses
 
 ### Check Status
-Look for: `Bot connected as YourBotName#1234`
+Look for: `Logged in as YourBotName#1234`
 
 ---
 
@@ -161,7 +161,7 @@ In Discord:
 
 **Voice Not Working:**
 - Ensure Connect/Speak permissions
-- Verify PyNaCl and ffmpeg installed
+- Verify Node.js version is 18+
 
 **OpenAI Errors:**
 - Check API key
