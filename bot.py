@@ -29,7 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("discordboy")
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # OpenAI client
@@ -95,7 +95,7 @@ async def finished_recording(
             history = conversation_history[user_id]
             history.append({"role": "user", "content": text})
 
-            # Keep history within limit (keep system prompt out of the count)
+            # Keep history within limit; each turn = 1 user msg + 1 assistant msg (2 entries)
             if len(history) > MAX_HISTORY * 2:
                 history = history[-(MAX_HISTORY * 2):]
                 conversation_history[user_id] = history
@@ -128,7 +128,7 @@ async def finished_recording(
         except Exception as exc:
             log.exception("Error processing audio for user %s: %s", user_id, exc)
             await channel.send(
-                f"⚠️ Sorry, I ran into an error processing your audio: `{exc}`"
+                "⚠️ Sorry, I ran into an error processing your audio. Please try again."
             )
 
 
@@ -205,7 +205,8 @@ async def leave(ctx: commands.Context):
             vc.stop_recording()
         except Exception:
             pass
-        await asyncio.sleep(1)  # give callback a moment to fire
+        # Give the finished_recording callback a moment to fire before disconnecting
+        await asyncio.sleep(1)
         await vc.disconnect()
 
     await ctx.send("👋 Left the voice channel. Goodbye!")
