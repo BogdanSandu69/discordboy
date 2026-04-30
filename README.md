@@ -1,19 +1,17 @@
 # discordboy 🎤🤖
 
-A Discord bot that wakes up when it hears **"Hello Logitrix"**, records the next 10 seconds of speech, transcribes it with **OpenAI Whisper**, and replies with **ChatGPT** — all in text chat.
+A Discord bot that records 10 seconds of speech on demand, transcribes it with **OpenAI Whisper**, and replies with **ChatGPT** — all in text chat.
 
 ---
 
 ## Features
 
 - 🎤 Joins Discord voice channels on demand
-- 👂 Passively listens for the wake word **"Hello Logitrix"**
+- 🔴 Records audio on command with `!record`
 - 🗣️ Transcribes speech to text using OpenAI Whisper
-- 🤖 Generates conversational replies via ChatGPT (GPT-3.5-turbo)
+- 🤖 Generates conversational replies via ChatGPT (GPT-3.5-turbo) with a deep-voice personality
 - 💬 Posts both the transcription and the AI reply in the text channel
 - 🧠 Maintains per-user conversation history
-- 🔄 Automatically returns to wake-word listening after each activation
-- 🛡️ Handles corrupted audio packets gracefully (auto-restarts receiver)
 - 🌐 Supports all languages that Whisper understands
 
 ---
@@ -106,8 +104,9 @@ python bot.py
 
 | Command | Description |
 |---------|-------------|
-| `!join` | Bot joins your current voice channel and starts listening for **"Hello Logitrix"** |
-| `!leave` | Bot stops listening and leaves the voice channel |
+| `!join` | Bot joins your current voice channel |
+| `!record [seconds]` | Record audio for the specified duration (default: 10s, max: 30s), then transcribe and respond |
+| `!leave` | Bot leaves the voice channel |
 | `!help` | Display this help information |
 
 ---
@@ -115,21 +114,27 @@ python bot.py
 ## How It Works
 
 1. Use `!join` while you're in a voice channel.
-2. The bot joins and passively listens for the wake word **"Hello Logitrix"**.
-3. Say **"Hello Logitrix"** — the bot detects it and starts recording:
+2. The bot joins passively — no continuous listening.
+3. Type `!record` to start a 10-second recording window:
 
 ```
-User: "Hello Logitrix, what's the weather like on Mars?"
-Bot: 🎤 Wake word detected! Recording for 10 seconds… speak now!
+User: !join
+Bot: ✅ Joined #voice-channel! Use !record to start recording.
+
+User: !record
+Bot: 🎤 Recording for 10 seconds… speak now!
+[10 seconds pass]
+Bot: 🔄 Processing your audio…
 
 Bot: **@YourName said:** What's the weather like on Mars?
-     **Bot:** Mars has an extremely thin atmosphere…
+     **Bot:** Well, Mars has an extremely thin atmosphere…
 
-Bot: 👂 Back to listening — say "Hello Logitrix" to activate.
+Bot: ✅ Ready! Use !record again to ask another question.
 ```
 
 4. Conversation history is maintained per user so the bot remembers context.
 5. Use `!leave` to disconnect the bot from the voice channel.
+6. Optionally specify a custom duration: `!record 15` for a 15-second window.
 
 ---
 
@@ -145,11 +150,11 @@ Bot: 👂 Back to listening — say "Hello Logitrix" to activate.
 ## Dependencies
 
 ```
-discord.py[voice]>=2.3.0        # Discord API with voice support
+discord.py[voice]>=2.3.0           # Discord API with voice support
 discord-ext-voice-recv==0.5.2a179  # Voice receiving extension
-openai>=1.0.0                   # Whisper STT + ChatGPT
-PyNaCl>=1.5.0                   # Voice encryption
-python-dotenv>=1.0.0            # .env file loading
+openai>=1.0.0                      # Whisper STT + ChatGPT
+PyNaCl>=1.5.0                      # Voice encryption
+python-dotenv>=1.0.0               # .env file loading
 ```
 
 ---
