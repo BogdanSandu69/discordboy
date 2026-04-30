@@ -1,6 +1,6 @@
 # discordboy 🎤🤖
 
-A Discord bot that records 10 seconds of speech on demand, transcribes it with **OpenAI Whisper**, and replies with **ChatGPT** — all in text chat.
+A Discord bot that records speech on demand, transcribes it with **OpenAI Whisper**, and replies with **ChatGPT** — all in text chat.
 
 ---
 
@@ -20,20 +20,13 @@ A Discord bot that records 10 seconds of speech on demand, transcribes it with *
 
 | Tool | Notes |
 |------|-------|
-| Python 3.10+ | [python.org](https://www.python.org/downloads/) |
-| ffmpeg | Required for audio processing (see below) |
+| Node.js 18+ | [nodejs.org](https://nodejs.org/) |
 | Discord Bot Token | [discord.com/developers](https://discord.com/developers/applications) |
 | OpenAI API Key | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 
-### Installing ffmpeg
-
-- **macOS**: `brew install ffmpeg`
-- **Ubuntu/Debian**: `sudo apt install ffmpeg`
-- **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
-
 ---
 
-## Setup
+## Installation
 
 ### 1. Clone the repository
 
@@ -42,12 +35,10 @@ git clone https://github.com/BogdanSandu69/discordboy.git
 cd discordboy
 ```
 
-### 2. Create a virtual environment and install dependencies
+### 2. Install dependencies
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+npm install
 ```
 
 ### 3. Configure environment variables
@@ -66,7 +57,7 @@ OPENAI_API_KEY=your_openai_api_key_here
 ### 4. Run the bot
 
 ```bash
-python bot.py
+npm start
 ```
 
 ---
@@ -115,7 +106,7 @@ python bot.py
 
 1. Use `!join` while you're in a voice channel.
 2. The bot joins passively — no continuous listening.
-3. Type `!record` to start a 10-second recording window:
+3. Type `!record` to start a recording window:
 
 ```
 User: !join
@@ -150,11 +141,13 @@ Bot: ✅ Ready! Use !record again to ask another question.
 ## Dependencies
 
 ```
-discord.py[voice]>=2.3.0           # Discord API with voice support
-discord-ext-voice-recv==0.5.2a179  # Voice receiving extension
-openai>=1.0.0                      # Whisper STT + ChatGPT
-PyNaCl>=1.5.0                      # Voice encryption
-python-dotenv>=1.0.0               # .env file loading
+discord.js ^14.14.1          Discord API client
+@discordjs/voice ^0.16.1     Voice connection and audio receiving
+opusscript ^0.1.1            Opus codec (pure JS, no native bindings needed)
+prism-media ^1.3.5           Audio processing (Opus decoding)
+libsodium-wrappers ^0.7.13   Voice encryption
+openai ^4.28.0               Whisper STT + ChatGPT
+dotenv ^16.4.1               .env file loading
 ```
 
 ---
