@@ -93,8 +93,33 @@ async function speakInChannel(connection, text) {
     player.play(resource);
 
     await new Promise((resolve, reject) => {
-      player.on(AudioPlayerStatus.Idle, resolve);
-      player.on('error', reject);
+      // Use 'once' to avoid duplicate callbacks if the player emits Idle
+      // multiple times, and to prevent listener accumulation.
+      // Clear the timeout and the opposing handler whenever one fires so all
+      // three paths (Idle, error, timeout) are mutually exclusive.
+      let timeoutId;
+
+      const onIdle = () => {
+        clearTimeout(timeoutId);
+        player.removeListener('error', onError);
+        resolve();
+      };
+
+      const onError = (err) => {
+        clearTimeout(timeoutId);
+        player.removeListener(AudioPlayerStatus.Idle, onIdle);
+        reject(err);
+      };
+
+      timeoutId = setTimeout(() => {
+        player.removeListener(AudioPlayerStatus.Idle, onIdle);
+        player.removeListener('error', onError);
+        player.stop(true);
+        reject(new Error('TTS playback timed out'));
+      }, 60_000);
+
+      player.once(AudioPlayerStatus.Idle, onIdle);
+      player.once('error', onError);
     });
   } finally {
     try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
@@ -286,15 +311,21 @@ async function handleRecord(message, args) {
     // Wait for the full recording window — collect audio from all users simultaneously
     await new Promise((resolve) => setTimeout(resolve, duration * 1000));
 
-    // Destroy all active streams after the window closes
+    // Destroy streams now that the recording window is closed.
+    // Destroy the source (audioStream) first so no new Opus packets reach the
+    // decoder, then destroy the decoder itself.
     for (const { audioStream, decodeStream, userId } of activeStreams) {
-      try { decodeStream.destroy(); } catch (err) {
-        log('warn', `[RECORD] Error destroying decode stream for user ${userId}: ${err.message}`);
-      }
       try { audioStream.destroy(); } catch (err) {
         log('warn', `[RECORD] Error destroying audio stream for user ${userId}: ${err.message}`);
       }
+      try { decodeStream.destroy(); } catch (err) {
+        log('warn', `[RECORD] Error destroying decode stream for user ${userId}: ${err.message}`);
+      }
     }
+
+    // Yield to the event loop so any data events already queued before
+    // destroy() was called have a chance to fire and populate userPcmChunks.
+    await new Promise((resolve) => setImmediate(resolve));
 
     await message.channel.send('🔄 Processing audio…');
 
@@ -389,6 +420,17 @@ async function handleRecord(message, args) {
     log('error', `[RECORD] Unexpected error in guild "${message.guild.name}":`, error);
     await message.channel.send('⚠️ An error occurred during recording. Please try again.');
   } finally {
+    // Safety cleanup: if an error interrupted the recording before the normal
+    // stream teardown ran, destroy any still-active streams here.
+    // Calling destroy() on an already-destroyed stream is a safe no-op.
+    for (const { audioStream, decodeStream, userId } of activeStreams) {
+      try { audioStream.destroy(); } catch (err) {
+        log('warn', `[RECORD] Error destroying audio stream for user ${userId}: ${err.message}`);
+      }
+      try { decodeStream.destroy(); } catch (err) {
+        log('warn', `[RECORD] Error destroying decode stream for user ${userId}: ${err.message}`);
+      }
+    }
     recordingInProgress.delete(message.guildId);
   }
 }
@@ -426,7 +468,7 @@ async function handleHelp(message) {
     .addFields(
       { name: '`!join`', value: 'Join your current voice channel.', inline: false },
       {
-        name: `!record [seconds]`,
+        name: '`!record [seconds]`',
         value: `Record audio for the specified duration (default: ${RECORDING_DURATION}s, max: ${MAX_RECORDING_DURATION}s), then transcribe and respond.`,
         inline: false,
       },
