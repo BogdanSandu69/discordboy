@@ -2,10 +2,12 @@ import asyncio
 import io
 import logging
 import os
+import threading
+import wave
 from collections import defaultdict
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -47,33 +49,85 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# guild_id -> discord.VoiceClient
-active_voice_clients: dict[int, discord.VoiceClient] = {}
+# guild_id -> voice_recv.VoiceRecvClient
+active_voice_clients: dict[int, voice_recv.VoiceRecvClient] = {}
 
 # guild_id -> text channel where responses are posted
 response_channels: dict[int, discord.TextChannel] = {}
+
+# guild_id -> VoiceBufferSink currently recording
+active_sinks: dict[int, "VoiceBufferSink"] = {}
 
 # user_id -> list of {"role": ..., "content": ...}  (conversation history)
 conversation_history: dict[int, list[dict]] = defaultdict(list)
 
 # ---------------------------------------------------------------------------
-# Audio callback
+# Audio sink
 # ---------------------------------------------------------------------------
 
 
-async def finished_recording(
-    sink: discord.sinks.WaveSink,
-    channel: discord.TextChannel,
-    *args,
-):
-    """Called by discord.py after stop_recording(); processes every user's audio."""
-    for user_id, audio in sink.audio_data.items():
+class VoiceBufferSink(voice_recv.AudioSink):
+    """Accumulates raw PCM audio per user in memory.
+
+    Audio is decoded to 48 kHz, stereo, 16-bit signed PCM by the library.
+    """
+
+    CHANNELS = 2
+    SAMPLE_WIDTH = 2       # 16-bit → 2 bytes per sample
+    SAMPLING_RATE = 48000
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._audio_data: dict[int, bytearray] = {}
+        self._lock = threading.Lock()
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user: discord.User | None, data: voice_recv.VoiceData) -> None:
+        if user is None:
+            return
+        with self._lock:
+            buf = self._audio_data.setdefault(user.id, bytearray())
+            buf.extend(data.pcm)
+
+    def cleanup(self) -> None:
+        pass
+
+    def get_wav_bytes(self, user_id: int) -> bytes:
+        """Return WAV-encoded audio for *user_id*, or empty bytes if none."""
+        with self._lock:
+            pcm = bytes(self._audio_data.get(user_id, b""))
+        if not pcm:
+            return b""
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(self.CHANNELS)
+            wf.setsampwidth(self.SAMPLE_WIDTH)
+            wf.setframerate(self.SAMPLING_RATE)
+            wf.writeframes(pcm)
+        return wav_buf.getvalue()
+
+    @property
+    def user_ids(self) -> list[int]:
+        with self._lock:
+            return list(self._audio_data.keys())
+
+
+# ---------------------------------------------------------------------------
+# Audio processing
+# ---------------------------------------------------------------------------
+
+
+async def process_audio(sink: VoiceBufferSink, channel: discord.TextChannel) -> None:
+    """Transcribe buffered audio for each user and post ChatGPT replies."""
+    for user_id in sink.user_ids:
         try:
-            raw_bytes = audio.file.read()
-            if not raw_bytes:
+            wav_bytes = sink.get_wav_bytes(user_id)
+            if not wav_bytes:
                 continue
 
-            audio_buf = io.BytesIO(raw_bytes)
+            audio_buf = io.BytesIO(wav_bytes)
             audio_buf.name = "audio.wav"
 
             log.info("Transcribing audio for user %s ...", user_id)
@@ -163,11 +217,17 @@ async def join(ctx: commands.Context):
         if vc.channel == voice_channel:
             await ctx.send("✅ I'm already in your voice channel and listening!")
             return
-        # Move to the new channel
+        # Move to the new channel – stop current sink and process its audio first
+        if vc.is_listening():
+            vc.stop_listening()
+        old_sink = active_sinks.pop(ctx.guild.id, None)
+        old_channel = response_channels.get(ctx.guild.id)
         await vc.move_to(voice_channel)
+        if old_sink and old_channel:
+            await process_audio(old_sink, old_channel)
     else:
         try:
-            vc = await voice_channel.connect()
+            vc = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
         except discord.ClientException as exc:
             await ctx.send(f"❌ Could not connect to the voice channel: {exc}")
             return
@@ -175,12 +235,10 @@ async def join(ctx: commands.Context):
     active_voice_clients[ctx.guild.id] = vc
     response_channels[ctx.guild.id] = ctx.channel
 
-    # Begin recording all users in the channel
-    vc.start_recording(
-        discord.sinks.WaveSink(),
-        finished_recording,
-        ctx.channel,
-    )
+    # Begin capturing audio from all users in the channel
+    sink = VoiceBufferSink()
+    active_sinks[ctx.guild.id] = sink
+    vc.listen(sink)
 
     await ctx.send(
         f"🎤 Joined **{voice_channel.name}** and started listening!\n"
@@ -197,20 +255,19 @@ async def leave(ctx: commands.Context):
         return
 
     vc = active_voice_clients.pop(ctx.guild.id)
-    response_channels.pop(ctx.guild.id, None)
+    sink = active_sinks.pop(ctx.guild.id, None)
+    channel = response_channels.pop(ctx.guild.id, None)
 
     if vc.is_connected():
-        # stop_recording triggers finished_recording callback
-        try:
-            vc.stop_recording()
-        except Exception:
-            pass
-        # Give the finished_recording callback a moment to fire before disconnecting
-        await asyncio.sleep(1)
+        if vc.is_listening():
+            vc.stop_listening()
         await vc.disconnect()
 
-    await ctx.send("👋 Left the voice channel. Goodbye!")
+    await ctx.send("👋 Left the voice channel. Processing your audio now…")
     log.info("Left voice channel in guild '%s'.", ctx.guild.name)
+
+    if sink and channel:
+        await process_audio(sink, channel)
 
 
 @bot.command(name="help")
