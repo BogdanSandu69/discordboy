@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: discordboy
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+    autoDeploy: true
