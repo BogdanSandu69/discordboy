@@ -4,6 +4,9 @@ const {
   EndBehaviorType,
   VoiceConnectionStatus,
   getVoiceConnection,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
 } = require('@discordjs/voice');
 const prism = require('prism-media');
 const fs = require('fs');
@@ -65,8 +68,38 @@ const conversationHistory = new Map();
 // System prompt
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are a helpful voice assistant with the personality of a wise, \
-experienced 50-year-old man with a deep, commanding voice.\n\nYour responses should be:\n- Thoughtful and measured, not rushed\n- Confident and authoritative, but friendly\n- Use mature vocabulary and complete sentences\n- Occasionally use phrases like "Well," "You see," "In my experience"\n- Keep responses concise but impactful\n- Sound like someone who has lived life and knows what they're talking about\n\nDon't mention your age or voice explicitly - just embody this personality naturally.`;
+const SYSTEM_PROMPT = `You are a helpful voice assistant with the personality of a wise, experienced 50-year-old man with a deep, commanding voice.\n\nYour responses should be:\n- Thoughtful and measured, not rushed\n- Confident and authoritative, but friendly\n- Use mature vocabulary and complete sentences\n- Occasionally use phrases like "Well," "You see," "In my experience"\n- Keep responses concise but impactful\n- Sound like someone who has lived life and knows what they're talking about\n\nDon't mention your age or voice explicitly - just embody this personality naturally.`;
+
+// ---------------------------------------------------------------------------
+// TTS helper — generate speech and play it in the voice channel
+// ---------------------------------------------------------------------------
+
+async function speakInChannel(connection, text) {
+  const tmpFile = path.join(os.tmpdir(), `tts_${Date.now()}.mp3`);
+  try {
+    const response = await openai.audio.speech.create({
+      model: 'tts-1',
+      voice: 'onyx', // deep voice fitting the wise-older-man persona
+      input: text,
+    });
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    fs.writeFileSync(tmpFile, buffer);
+
+    const player = createAudioPlayer();
+    const resource = createAudioResource(tmpFile);
+
+    connection.subscribe(player);
+    player.play(resource);
+
+    await new Promise((resolve, reject) => {
+      player.on(AudioPlayerStatus.Idle, resolve);
+      player.on('error', reject);
+    });
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Bot events
@@ -137,8 +170,14 @@ async function handleJoin(message) {
     selfMute: false,
   });
 
-  connection.on(VoiceConnectionStatus.Ready, () => {
+  connection.on(VoiceConnectionStatus.Ready, async () => {
     log('info', `Connected to voice channel "${voiceChannel.name}" in guild "${message.guild.name}".`);
+    // Speak a greeting in the voice channel
+    try {
+      await speakInChannel(connection, "Well, hello there. DiscordBoy at your service. Use the record command whenever you're ready to speak with me.");
+    } catch (err) {
+      log('error', 'Failed to speak greeting:', err.message);
+    }
   });
 
   connection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -147,11 +186,6 @@ async function handleJoin(message) {
 
   await message.reply(
     `✅ Joined **${voiceChannel.name}**! Use \`!record\` to start recording.\nUse \`!leave\` to disconnect.`
-  );
-
-  // Greeting so you know the bot is alive and can speak
-  await message.channel.send(
-    `👋 Hey everyone! DiscordBoy here — your AI voice assistant. I'm all ears. Use \`!record\` whenever you're ready to talk to me!`
   );
 
   log('info', `Joined voice channel "${voiceChannel.name}" in guild "${message.guild.name}".`);
@@ -332,6 +366,13 @@ async function handleRecord(message, args) {
 
         await message.channel.send(`**<@${userId}> said:** ${text}\n**Bot:** ${reply}`);
 
+        // Speak the reply aloud in the voice channel
+        try {
+          await speakInChannel(connection, reply);
+        } catch (err) {
+          log('error', `[RECORD] Failed to speak reply for user ${userId}: ${err.message}`);
+        }
+
       } catch (err) {
         log('error', `[RECORD] Error processing audio for user ${userId}: ${err.message}`);
         await message.channel.send(`<@${userId}>: ⚠️ Failed to process your audio. (${err.message})`);
@@ -385,7 +426,7 @@ async function handleHelp(message) {
     .addFields(
       { name: '`!join`', value: 'Join your current voice channel.', inline: false },
       {
-        name: `\`!record [seconds]\``,
+        name: `!record [seconds]`,
         value: `Record audio for the specified duration (default: ${RECORDING_DURATION}s, max: ${MAX_RECORDING_DURATION}s), then transcribe and respond.`,
         inline: false,
       },
