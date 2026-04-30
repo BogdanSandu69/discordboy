@@ -159,13 +159,18 @@ In Discord:
 - Verify environment variables
 - Check Discord permissions
 
-**Voice Not Working:**
-- Ensure Connect/Speak permissions
-- Verify Node.js version is 18+
+**"No open ports detected" warning in Render logs:**
+- The bot now binds a lightweight HTTP health-check server on `process.env.PORT`.
+  Make sure you have NOT overridden `PORT` to a value Render doesn't forward.
+  Simply redeploy and the warning will disappear.
 
-**OpenAI Errors:**
-- Check API key
-- Verify billing/credits
+**Voice Not Working / 0 bytes audio received:**
+- This symptom usually means Render was restarting the bot mid-recording because
+  no HTTP port was bound (see above). After the health-check server fix the
+  process stays alive throughout the full recording window.
+- Ensure Connect/Speak permissions are granted to the bot
+- Verify Node.js version is 18+
+- Make sure you are **not muted** in Discord during the recording window
 
 ---
 

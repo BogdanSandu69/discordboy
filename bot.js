@@ -10,6 +10,7 @@ const {
 } = require('@discordjs/voice');
 const prism = require('prism-media');
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const { OpenAI } = require('openai');
@@ -536,5 +537,19 @@ if (!OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY is not set. Copy .env.example to .env and fill in your API key.');
   process.exit(1);
 }
+
+// ---------------------------------------------------------------------------
+// Health-check HTTP server
+// ---------------------------------------------------------------------------
+// Render (and UptimeRobot) require the process to bind a port.
+// Without this, Render marks the web service as unhealthy and may restart
+// the process mid-recording — which is why audio buffers show 0 bytes.
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+}).listen(PORT, () => {
+  log('info', `Health-check server listening on port ${PORT}`);
+});
 
 client.login(DISCORD_TOKEN);
