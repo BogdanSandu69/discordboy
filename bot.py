@@ -4,10 +4,8 @@ import logging
 import os
 import struct
 import threading
-import time
 import wave
 from collections import defaultdict
-from enum import Enum, auto
 
 import discord
 from discord.ext import commands, voice_recv
@@ -26,15 +24,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Maximum number of conversation turns kept in memory per user
 MAX_HISTORY = 10
 
-# Wake word settings
-WAKE_WORD = "hello logitrix"
-WAKE_CHECK_INTERVAL = 3.0    # seconds between wake-word checks
-WAKE_BUFFER_SECONDS = 3.0    # rolling audio window used for wake-word detection
-RECORD_DURATION = 10.0       # seconds to record after the wake word
-MIN_ACTIVATION_GAP = 2.0     # minimum seconds between activations
+# Recording settings
+RECORDING_DURATION = 10      # default recording duration in seconds
+MAX_RECORDING_DURATION = 30  # maximum allowed recording duration
+MIN_RECORDING_DURATION = 3   # minimum allowed recording duration
 SPEECH_THRESHOLD = 200.0     # average PCM amplitude required to bother calling Whisper
 SPEECH_SAMPLE_INTERVAL_MS = 10  # sample every N ms for energy detection
-WAKE_WORD_STRIP_CHARS = " ,!?"  # characters to strip after removing leading wake word
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -65,43 +60,19 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # guild_id -> voice_recv.VoiceRecvClient
 active_voice_clients: dict[int, voice_recv.VoiceRecvClient] = {}
 
-# guild_id -> text channel where responses are posted
-response_channels: dict[int, discord.TextChannel] = {}
-
-# guild_id -> WakeWordSink currently in use
-active_sinks: dict[int, "WakeWordSink"] = {}
-
-# guild_id -> background asyncio Task running the wake-word loop
-active_tasks: dict[int, asyncio.Task] = {}
-
-# guild_id -> monotonic time of last successful wake-word activation
-last_activation: dict[int, float] = {}
+# guild_id -> whether a !record session is currently in progress
+recording_in_progress: set[int] = set()
 
 # user_id -> list of {"role": ..., "content": ...}  (conversation history)
 conversation_history: dict[int, list[dict]] = defaultdict(list)
-
-# ---------------------------------------------------------------------------
-# State machine
-# ---------------------------------------------------------------------------
-
-
-class State(Enum):
-    WAITING = auto()    # passively listening for the wake word
-    RECORDING = auto()  # recording speech after wake word was detected
-
 
 # ---------------------------------------------------------------------------
 # Audio sink
 # ---------------------------------------------------------------------------
 
 
-class WakeWordSink(voice_recv.AudioSink):
-    """Dual-mode audio sink.
-
-    * WAITING mode  – maintains a rolling PCM buffer (last *wake_buffer_seconds*
-      of audio) per user for cheap energy-gated wake-word detection.
-    * RECORDING mode – accumulates all incoming PCM per user so the full
-      utterance can be sent to Whisper.
+class VoiceBufferSink(voice_recv.AudioSink):
+    """Simple audio sink that accumulates PCM data per user during recording.
 
     Audio delivered by discord-ext-voice-recv is already decoded to
     48 kHz / stereo / 16-bit signed PCM.
@@ -110,14 +81,10 @@ class WakeWordSink(voice_recv.AudioSink):
     CHANNELS = 2
     SAMPLE_WIDTH = 2        # 16-bit → 2 bytes per sample
     SAMPLING_RATE = 48000
-    BYTES_PER_SECOND = CHANNELS * SAMPLE_WIDTH * SAMPLING_RATE  # 192 000
 
-    def __init__(self, wake_buffer_seconds: float = WAKE_BUFFER_SECONDS) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._max_wake_bytes = int(wake_buffer_seconds * self.BYTES_PER_SECOND)
-        self._wake_data: dict[int, bytearray] = {}    # rolling per-user buffer
-        self._record_data: dict[int, bytearray] = {}  # accumulation buffer
-        self._recording = False
+        self._record_data: dict[int, bytearray] = {}
         self._lock = threading.Lock()
 
     # -- AudioSink interface -----------------------------------------------
@@ -128,56 +95,22 @@ class WakeWordSink(voice_recv.AudioSink):
     def write(self, user: discord.User | None, data: voice_recv.VoiceData) -> None:
         if user is None:
             return
-        pcm = data.pcm
         with self._lock:
-            if self._recording:
-                self._record_data.setdefault(user.id, bytearray()).extend(pcm)
-            else:
-                buf = self._wake_data.setdefault(user.id, bytearray())
-                buf.extend(pcm)
-                excess = len(buf) - self._max_wake_bytes
-                if excess > 0:
-                    del buf[:excess]
+            self._record_data.setdefault(user.id, bytearray()).extend(data.pcm)
 
     def cleanup(self) -> None:
         pass
 
-    # -- Wake-word helpers -------------------------------------------------
-
-    def get_wake_wav(self, user_id: int) -> bytes:
-        """Return WAV-encoded rolling buffer for *user_id*, or b'' if empty."""
-        with self._lock:
-            pcm = bytes(self._wake_data.get(user_id, b""))
-        return self._pcm_to_wav(pcm) if pcm else b""
-
-    def get_wake_pcm(self, user_id: int) -> bytes:
-        """Return raw PCM bytes from wake buffer for *user_id*."""
-        with self._lock:
-            return bytes(self._wake_data.get(user_id, b""))
-
-    @property
-    def wake_user_ids(self) -> list[int]:
-        with self._lock:
-            return list(self._wake_data.keys())
-
     # -- Recording helpers -------------------------------------------------
 
-    def start_recording(self) -> None:
-        """Switch to RECORDING mode and clear any previous recording."""
+    def get_recording(self) -> dict[int, bytes]:
+        """Return WAV bytes keyed by user_id for all users who spoke."""
         with self._lock:
-            self._recording = True
-            self._record_data.clear()
-
-    def stop_and_get_recording(self) -> dict[int, bytes]:
-        """Switch back to WAITING mode; return WAV bytes keyed by user_id."""
-        with self._lock:
-            self._recording = False
             result: dict[int, bytes] = {}
             for uid, pcm in self._record_data.items():
                 if pcm:
                     result[uid] = self._pcm_to_wav(bytes(pcm))
-            self._record_data.clear()
-        return result
+            return result
 
     # -- PCM → WAV ---------------------------------------------------------
 
@@ -207,7 +140,7 @@ def _has_speech(pcm: bytes, threshold: float = SPEECH_THRESHOLD) -> bool:
     # Each sample is a 16-bit signed int (2 bytes); step ≈ SPEECH_SAMPLE_INTERVAL_MS of audio
     step = max(
         2,
-        (WakeWordSink.SAMPLING_RATE * WakeWordSink.CHANNELS * WakeWordSink.SAMPLE_WIDTH
+        (VoiceBufferSink.SAMPLING_RATE * VoiceBufferSink.CHANNELS * VoiceBufferSink.SAMPLE_WIDTH
          * SPEECH_SAMPLE_INTERVAL_MS) // 1000,
     )
     # Align step to 2-byte boundary
@@ -228,18 +161,13 @@ def _has_speech(pcm: bytes, threshold: float = SPEECH_THRESHOLD) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_sync(wav_bytes: bytes, prompt: str = "") -> str:
+def _transcribe_sync(wav_bytes: bytes) -> str:
     """Blocking Whisper transcription – call via run_in_executor."""
     buf = io.BytesIO(wav_bytes)
     buf.name = "audio.wav"
-    if prompt:
-        result = openai_client.audio.transcriptions.create(
-            model="whisper-1", file=buf, prompt=prompt
-        )
-    else:
-        result = openai_client.audio.transcriptions.create(
-            model="whisper-1", file=buf
-        )
+    result = openai_client.audio.transcriptions.create(
+        model="whisper-1", file=buf
+    )
     return result.text.strip()
 
 
@@ -252,9 +180,9 @@ def _chat_sync(messages: list[dict]) -> str:
     return completion.choices[0].message.content.strip()
 
 
-async def _transcribe(wav_bytes: bytes, prompt: str = "") -> str:
+async def _transcribe(wav_bytes: bytes) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _transcribe_sync, wav_bytes, prompt)
+    return await loop.run_in_executor(None, _transcribe_sync, wav_bytes)
 
 
 async def _chat(messages: list[dict]) -> str:
@@ -263,71 +191,78 @@ async def _chat(messages: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Wake-word check
+# System prompt
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are a helpful voice assistant with the personality of a wise, \
+experienced 50-year-old man with a deep, commanding voice.
+
+Your responses should be:
+- Thoughtful and measured, not rushed
+- Confident and authoritative, but friendly
+- Use mature vocabulary and complete sentences
+- Occasionally use phrases like "Well," "You see," "In my experience"
+- Keep responses concise but impactful
+- Sound like someone who has lived life and knows what they're talking about
+
+Don't mention your age or voice explicitly - just embody this personality naturally."""
+
+
+# ---------------------------------------------------------------------------
+# Audio processing: transcribe and reply
 # ---------------------------------------------------------------------------
 
 
-async def _contains_wake_word(wav_bytes: bytes) -> bool:
-    """Return True when Whisper detects the wake word in *wav_bytes*."""
-    try:
-        text = await _transcribe(wav_bytes, prompt="hello logitrix")
-        return WAKE_WORD in text.lower()
-    except Exception as exc:
-        log.warning("Wake-word transcription error (skipping): %s", exc)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Post-wake-word audio processing
-# ---------------------------------------------------------------------------
-
-
-async def process_recording(
-    recording: dict[int, bytes], channel: discord.TextChannel
+async def process_audio(
+    sink: VoiceBufferSink,
+    channel: discord.TextChannel,
+    requesting_user_id: int,
 ) -> None:
-    """Transcribe a wake-word-triggered recording and post ChatGPT replies."""
+    """Transcribe recorded audio and post ChatGPT replies.
+
+    Processes audio from all users who spoke during the recording window.
+    Falls back to a single combined response attributed to the requesting user
+    if no audio is found for other individual users.
+    """
+    recording = sink.get_recording()
+
+    if not recording:
+        await channel.send("🔇 No audio detected. Make sure you spoke during the recording!")
+        return
+
     for user_id, wav_bytes in recording.items():
         try:
-            log.info("Transcribing post-wake recording for user %s…", user_id)
+            # Energy-gate: skip silent buffers to avoid unnecessary Whisper calls
+            pcm_buf = io.BytesIO(wav_bytes)
+            with wave.open(pcm_buf, "rb") as wf:
+                raw_pcm = wf.readframes(wf.getnframes())
+            if not _has_speech(raw_pcm):
+                log.info("No speech energy detected for user %s – skipping.", user_id)
+                continue
+
+            log.info("Transcribing recording for user %s…", user_id)
             text = await _transcribe(wav_bytes)
             if not text:
                 log.info("Empty transcription for user %s – skipping.", user_id)
                 continue
 
-            # Strip the wake word from the beginning of the transcript
-            cleaned = text.strip()
-            lower = cleaned.lower()
-            if lower.startswith(WAKE_WORD):
-                cleaned = cleaned[len(WAKE_WORD):].lstrip(WAKE_WORD_STRIP_CHARS)
-            if not cleaned:
-                log.info("Only wake word spoken by user %s – skipping.", user_id)
-                continue
-
-            log.info("Transcribed (user %s): %s", user_id, cleaned)
+            log.info("Transcribed (user %s): %s", user_id, text)
 
             # Build conversation context
             history = conversation_history[user_id]
-            history.append({"role": "user", "content": cleaned})
+            history.append({"role": "user", "content": text})
             if len(history) > MAX_HISTORY * 2:
                 history = history[-(MAX_HISTORY * 2):]
                 conversation_history[user_id] = history
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful, friendly voice assistant on Discord. "
-                        "Keep responses concise and conversational."
-                    ),
-                }
-            ] + history
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
             log.info("Requesting ChatGPT response for user %s…", user_id)
             reply = await _chat(messages)
             history.append({"role": "assistant", "content": reply})
 
             await channel.send(
-                f"**<@{user_id}> said:** {cleaned}\n**Bot:** {reply}"
+                f"**<@{user_id}> said:** {text}\n**Bot:** {reply}"
             )
 
         except Exception as exc:
@@ -335,93 +270,6 @@ async def process_recording(
             await channel.send(
                 "⚠️ Sorry, I ran into an error processing your audio. Please try again."
             )
-
-
-# ---------------------------------------------------------------------------
-# Background wake-word loop
-# ---------------------------------------------------------------------------
-
-
-async def wake_word_loop(
-    guild_id: int,
-    vc: voice_recv.VoiceRecvClient,
-    sink: WakeWordSink,
-    channel: discord.TextChannel,
-) -> None:
-    """Background task: listen for wake word, record, transcribe, reply."""
-    state = State.WAITING
-    log.info("Wake-word loop started for guild %s.", guild_id)
-
-    try:
-        while guild_id in active_voice_clients:
-            if state == State.WAITING:
-                await asyncio.sleep(WAKE_CHECK_INTERVAL)
-
-                # Restart the voice receiver if the router crashed (e.g. corrupted
-                # Opus packets) – this is the main resilience mechanism.
-                if not vc.is_listening():
-                    log.warning(
-                        "Voice receiver stopped unexpectedly in guild %s; restarting.",
-                        guild_id,
-                    )
-                    try:
-                        vc.listen(sink)
-                    except Exception as exc:
-                        log.error("Failed to restart voice receiver: %s", exc)
-                    continue
-
-                # Rate-limit activations
-                now = time.monotonic()
-                if guild_id in last_activation:
-                    if now - last_activation[guild_id] < MIN_ACTIVATION_GAP:
-                        continue
-
-                # Check each user's rolling buffer for the wake word.
-                # Energy-gate first to avoid unnecessary Whisper calls.
-                for user_id in sink.wake_user_ids:
-                    pcm = sink.get_wake_pcm(user_id)
-                    if not _has_speech(pcm):
-                        continue
-                    wav = sink.get_wake_wav(user_id)
-                    if not wav:
-                        continue
-                    if await _contains_wake_word(wav):
-                        log.info(
-                            "Wake word detected from user %s in guild %s.",
-                            user_id,
-                            guild_id,
-                        )
-                        last_activation[guild_id] = time.monotonic()
-                        state = State.RECORDING
-                        sink.start_recording()
-                        await channel.send(
-                            f"🎤 Wake word detected! Recording for "
-                            f"{int(RECORD_DURATION)} seconds… speak now!"
-                        )
-                        break  # one activation per check cycle
-
-            elif state == State.RECORDING:
-                await asyncio.sleep(RECORD_DURATION)
-                recording = sink.stop_and_get_recording()
-                state = State.WAITING
-
-                if not recording:
-                    await channel.send(
-                        "🔇 No audio detected after wake word. "
-                        'Say **"Hello Logitrix"** to try again.'
-                    )
-                else:
-                    await process_recording(recording, channel)
-                    await channel.send(
-                        '👂 Back to listening — say **"Hello Logitrix"** to activate.'
-                    )
-
-    except asyncio.CancelledError:
-        log.info("Wake-word loop cancelled for guild %s.", guild_id)
-    except Exception as exc:
-        log.exception(
-            "Unexpected error in wake-word loop for guild %s: %s", guild_id, exc
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -435,21 +283,14 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening,
-            name='"Hello Logitrix"',
+            name="!record",
         )
     )
 
 
-def _cancel_guild_task(guild_id: int) -> None:
-    """Cancel and remove the background task for *guild_id* if it exists."""
-    task = active_tasks.pop(guild_id, None)
-    if task and not task.done():
-        task.cancel()
-
-
 @bot.command(name="join")
 async def join(ctx: commands.Context):
-    """Join the caller's voice channel and listen for the wake word."""
+    """Join the caller's voice channel."""
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("❌ You must be in a voice channel first!")
         return
@@ -460,16 +301,12 @@ async def join(ctx: commands.Context):
         vc = active_voice_clients[ctx.guild.id]
         if vc.channel == voice_channel:
             await ctx.send(
-                "✅ I'm already listening in your voice channel! "
-                'Say **"Hello Logitrix"** to activate.'
+                "✅ I'm already in your voice channel! Use `!record` to start recording."
             )
             return
-        # Move to a different channel: tear down existing state first
-        _cancel_guild_task(ctx.guild.id)
+        # Move to a different channel
         if vc.is_listening():
             vc.stop_listening()
-        active_sinks.pop(ctx.guild.id, None)
-        response_channels.pop(ctx.guild.id, None)
         await vc.move_to(voice_channel)
     else:
         try:
@@ -479,19 +316,9 @@ async def join(ctx: commands.Context):
             return
 
     active_voice_clients[ctx.guild.id] = vc
-    response_channels[ctx.guild.id] = ctx.channel
-
-    sink = WakeWordSink()
-    active_sinks[ctx.guild.id] = sink
-    vc.listen(sink)
-
-    task = asyncio.create_task(
-        wake_word_loop(ctx.guild.id, vc, sink, ctx.channel)
-    )
-    active_tasks[ctx.guild.id] = task
 
     await ctx.send(
-        f'🎤 Joined **{voice_channel.name}**! Say **"Hello Logitrix"** to activate.\n'
+        f"✅ Joined **{voice_channel.name}**! Use `!record` to start recording.\n"
         "Use `!leave` to disconnect."
     )
     log.info(
@@ -501,16 +328,15 @@ async def join(ctx: commands.Context):
 
 @bot.command(name="leave")
 async def leave(ctx: commands.Context):
-    """Stop listening and leave the voice channel."""
+    """Leave the voice channel."""
     if ctx.guild.id not in active_voice_clients:
         await ctx.send("❌ I'm not in a voice channel right now.")
         return
 
-    _cancel_guild_task(ctx.guild.id)
+    # Cancel any in-progress recording
+    recording_in_progress.discard(ctx.guild.id)
+
     vc = active_voice_clients.pop(ctx.guild.id)
-    active_sinks.pop(ctx.guild.id, None)
-    response_channels.pop(ctx.guild.id, None)
-    last_activation.pop(ctx.guild.id, None)
 
     if vc.is_connected():
         if vc.is_listening():
@@ -521,28 +347,83 @@ async def leave(ctx: commands.Context):
     log.info("Left voice channel in guild '%s'.", ctx.guild.name)
 
 
+@bot.command(name="record")
+async def record(ctx: commands.Context, duration: int = RECORDING_DURATION):
+    """Record audio for the specified duration (default 10s), transcribe, and respond."""
+    if ctx.guild.id not in active_voice_clients:
+        await ctx.send("❌ I'm not in a voice channel! Use `!join` first.")
+        return
+
+    vc = active_voice_clients[ctx.guild.id]
+
+    if not ctx.author.voice or ctx.author.voice.channel != vc.channel:
+        await ctx.send("❌ You must be in the same voice channel as me!")
+        return
+
+    if ctx.guild.id in recording_in_progress:
+        await ctx.send("⏳ Already recording! Please wait for the current recording to finish.")
+        return
+
+    # Clamp duration to allowed range
+    duration = max(MIN_RECORDING_DURATION, min(duration, MAX_RECORDING_DURATION))
+
+    recording_in_progress.add(ctx.guild.id)
+    sink = VoiceBufferSink()
+
+    try:
+        # Stop any previous listening before starting fresh
+        if vc.is_listening():
+            vc.stop_listening()
+
+        vc.listen(sink)
+        await ctx.send(f"🎤 Recording for {duration} seconds… speak now!")
+        log.info("Recording started in guild '%s' for %s seconds.", ctx.guild.name, duration)
+
+        await asyncio.sleep(duration)
+
+        vc.stop_listening()
+        await ctx.send("🔄 Processing your audio…")
+
+        await process_audio(sink, ctx.channel, ctx.author.id)
+        await ctx.send("✅ Ready! Use `!record` again to ask another question.")
+
+    except Exception as exc:
+        log.exception("Error during recording in guild '%s': %s", ctx.guild.name, exc)
+        await ctx.send("⚠️ An error occurred during recording. Please try again.")
+    finally:
+        recording_in_progress.discard(ctx.guild.id)
+        # Ensure we stop listening if something went wrong mid-session
+        if vc.is_listening():
+            vc.stop_listening()
+
+
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
     """Display available commands."""
     embed = discord.Embed(
         title="🤖 DiscordBoy – Voice AI Bot",
         description=(
-            'Say **"Hello Logitrix"** to wake me up, then speak your message. '
-            "I'll transcribe it and reply via ChatGPT!"
+            "Use `!record` to ask me anything from your voice channel. "
+            "I'll transcribe your speech and reply with ChatGPT!"
         ),
         color=discord.Color.blurple(),
     )
     embed.add_field(
         name="`!join`",
+        value="Join your current voice channel.",
+        inline=False,
+    )
+    embed.add_field(
+        name="`!record [seconds]`",
         value=(
-            'Join your current voice channel and start listening for '
-            '**"Hello Logitrix"**.'
+            f"Record audio for the specified duration (default: {RECORDING_DURATION}s, "
+            f"max: {MAX_RECORDING_DURATION}s), then transcribe and respond."
         ),
         inline=False,
     )
     embed.add_field(
         name="`!leave`",
-        value="Stop listening and leave the voice channel.",
+        value="Leave the voice channel.",
         inline=False,
     )
     embed.add_field(
@@ -554,9 +435,10 @@ async def help_command(ctx: commands.Context):
         name="💡 Usage",
         value=(
             "1. Join a voice channel and type `!join`\n"
-            '2. Say **"Hello Logitrix"** to activate the bot\n'
-            "3. Speak your message within the next 10 seconds\n"
-            "4. The bot will transcribe your words and reply!"
+            "2. Type `!record` to start a 10-second recording\n"
+            "3. Speak your message during the recording window\n"
+            "4. The bot will transcribe your words and reply!\n"
+            "5. Use `!record` again to ask another question"
         ),
         inline=False,
     )
